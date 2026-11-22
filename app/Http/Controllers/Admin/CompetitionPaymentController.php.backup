@@ -1,0 +1,221 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\Competition;
+use App\Models\CompetitionPaymentMethod;
+use App\Models\CompetitionPaymentSetting;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
+
+class CompetitionPaymentController extends Controller
+{
+    /**
+     * Menampilkan seluruh kompetisi beserta status pembayarannya.
+     */
+    public function index()
+    {
+        $competitions = Competition::with('paymentSetting')
+            ->latest()
+            ->paginate(10);
+
+        return view('admin.payments.index', compact('competitions'));
+    }
+
+    /**
+     * Menampilkan halaman pengaturan pembayaran satu kompetisi.
+     */
+    public function edit(Competition $competition)
+    {
+        // Ambil konfigurasi pembayaran beserta seluruh metode yang tersedia.
+        $competition->load('paymentSetting.paymentMethods');
+
+        return view('admin.payments.edit', compact('competition'));
+    }
+
+    /**
+     * Menyimpan konfigurasi pembayaran kompetisi.
+     */
+    public function update(Request $request, Competition $competition)
+    {
+        $validated = $request->validate([
+            'is_payment_required' => ['required', 'boolean'],
+            'fee_amount' => [
+                'nullable',
+                'required_if:is_payment_required,1',
+                'integer',
+                'min:1',
+            ],
+            'description' => ['nullable', 'string', 'max:1000'],
+            'instructions' => ['nullable', 'string'],
+        ]);
+
+        // Kompetisi gratis tidak memiliki biaya pendaftaran.
+        $validated['fee_amount'] = $validated['is_payment_required']
+            ? $validated['fee_amount']
+            : 0;
+
+        // Satu kompetisi hanya memiliki satu konfigurasi pembayaran.
+        CompetitionPaymentSetting::updateOrCreate(
+            ['competition_id' => $competition->id],
+            $validated
+        );
+
+        alert()->success('Berhasil', 'Pengaturan pembayaran berhasil disimpan.');
+
+        return redirect()
+            ->route('admin.payments.edit', $competition)
+            ->with('success', 'Pengaturan pembayaran berhasil disimpan.');
+    }
+
+    /**
+     * Menambahkan metode pembayaran baru.
+     */
+    public function storeMethod(Request $request, Competition $competition)
+    {
+        // Pastikan konfigurasi pembayaran sudah tersedia.
+        $setting = $competition->paymentSetting;
+
+        abort_unless($setting, 404, 'Pengaturan pembayaran belum tersedia.');
+
+        $validated = $request->validate([
+            'method_type' => ['required', Rule::in(['bank', 'ewallet', 'qris'])],
+            'provider_name' => ['required', 'string', 'max:100'],
+            'account_name' => [
+                'nullable',
+                'required_unless:method_type,qris',
+                'string',
+                'max:150',
+            ],
+            'account_number' => [
+                'nullable',
+                'required_unless:method_type,qris',
+                'string',
+                'max:100',
+            ],
+            'image' => [
+                'nullable',
+                'required_if:method_type,qris',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:2048',
+            ],
+            'sort_order' => ['nullable', 'integer', 'min:0'],
+            'is_active' => ['nullable', 'boolean'],
+        ]);
+
+        // Simpan gambar QRIS jika metode yang dipilih adalah QRIS.
+        $imagePath = null;
+
+        if ($request->hasFile('image')) {
+            $imagePath = $request->file('image')
+                ->store('payment-qris', 'public');
+        }
+
+        // Hubungkan metode pembayaran dengan konfigurasi kompetisinya.
+        $setting->paymentMethods()->create([
+            'method_type' => $validated['method_type'],
+            'provider_name' => $validated['provider_name'],
+            'account_name' => $validated['account_name'] ?? null,
+            'account_number' => $validated['account_number'] ?? null,
+            'image_path' => $imagePath,
+            'sort_order' => $validated['sort_order'] ?? 0,
+            'is_active' => $request->boolean('is_active'),
+        ]);
+
+        alert()->success('Berhasil', 'Metode pembayaran berhasil ditambahkan.');
+
+        return back();
+    }
+
+    /**
+     * Memperbarui metode pembayaran yang sudah ada.
+     */
+    public function updateMethod(
+        Request $request,
+        Competition $competition,
+        CompetitionPaymentMethod $method
+    ) {
+        // Cegah admin mengubah metode milik kompetisi lain.
+        abort_unless(
+            $competition->paymentSetting?->id === $method->competition_payment_setting_id,
+            404
+        );
+
+        $validated = $request->validate([
+            'method_type' => ['required', Rule::in(['bank', 'ewallet', 'qris'])],
+            'provider_name' => ['required', 'string', 'max:100'],
+            'account_name' => [
+                'nullable',
+                'required_unless:method_type,qris',
+                'string',
+                'max:150',
+            ],
+            'account_number' => [
+                'nullable',
+                'required_unless:method_type,qris',
+                'string',
+                'max:100',
+            ],
+            'image' => [
+                'nullable',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:2048',
+            ],
+            'sort_order' => ['nullable', 'integer', 'min:0'],
+            'is_active' => ['nullable', 'boolean'],
+        ]);
+
+        // Ganti gambar lama hanya jika admin mengunggah gambar baru.
+        if ($request->hasFile('image')) {
+            if ($method->image_path) {
+                Storage::disk('public')->delete($method->image_path);
+            }
+
+            $validated['image_path'] = $request->file('image')
+                ->store('payment-qris', 'public');
+        }
+
+        $method->update([
+            'method_type' => $validated['method_type'],
+            'provider_name' => $validated['provider_name'],
+            'account_name' => $validated['account_name'] ?? null,
+            'account_number' => $validated['account_number'] ?? null,
+            'image_path' => $validated['image_path'] ?? $method->image_path,
+            'sort_order' => $validated['sort_order'] ?? 0,
+            'is_active' => $request->boolean('is_active'),
+        ]);
+
+        alert()->success('Berhasil', 'Metode pembayaran berhasil diperbarui.');
+
+        return back();
+    }
+
+    /**
+     * Menghapus metode pembayaran.
+     */
+    public function destroyMethod(
+        Competition $competition,
+        CompetitionPaymentMethod $method
+    ) {
+        // Pastikan metode yang dihapus memang milik kompetisi tersebut.
+        abort_unless(
+            $competition->paymentSetting?->id === $method->competition_payment_setting_id,
+            404
+        );
+
+        // Hapus gambar QRIS dari penyimpanan jika tersedia.
+        if ($method->image_path) {
+            Storage::disk('public')->delete($method->image_path);
+        }
+
+        $method->delete();
+
+        alert()->success('Berhasil', 'Metode pembayaran berhasil dihapus.');
+
+        return back();
+    }
+}
